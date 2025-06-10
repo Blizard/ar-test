@@ -70,6 +70,25 @@ data class DetectedObject(
     val distance: Float
 )
 
+// Configuration constants
+object ARDetectionConfig {
+    // Tilt angle configuration
+    const val TARGET_ANGLE = -45f           // Target tilt angle in degrees
+    const val ANGLE_TOLERANCE = 10f         // Acceptable deviation from target angle
+    
+    // Detection configuration
+    const val MIN_CONFIDENCE = 0.5f         // Minimum confidence threshold (60%)
+    const val DETECTION_INTERVAL_MS = 3000L // Detection interval in milliseconds
+    
+    // Detection zone configuration
+    const val DETECTION_ZONE_WIDTH_RATIO = 0.4f   // Detection zone width as ratio of screen width
+    const val DETECTION_ZONE_HEIGHT_RATIO = 0.3f  // Detection zone height as ratio of screen height
+    
+    // Distance calculation
+    const val CAMERA_FOCAL_LENGTH_PX = 800f // Approximate focal length in pixels
+    const val DEFAULT_OBJECT_WIDTH_M = 0.3f // Default object width for unknown objects (30cm)
+}
+
 class TiltSensorManager(
     private val context: Context,
     private val onTiltChanged: (Float) -> Unit,
@@ -146,9 +165,12 @@ class TensorFlowObjectDetector(private val context: Context) {
     private var labels: List<String> = emptyList()
     
     companion object {
-        private const val MODEL_PATH = "1.tflite"
+        private const val MODEL_PATH = "2.tflite"
         private const val INPUT_SIZE = 320
-        private const val DETECTION_THRESHOLD = 0.5f
+        
+        // Configurable detection parameters
+        const val DETECTION_THRESHOLD = ARDetectionConfig.MIN_CONFIDENCE  // Use config value
+        const val MAX_DETECTIONS = 10         // Maximum number of detections to process
     }
     
     init {
@@ -196,37 +218,79 @@ class TensorFlowObjectDetector(private val context: Context) {
         val detectedObjects = mutableListOf<DetectedObject>()
         
         try {
+            val interpreter = this.interpreter ?: return emptyList()
+            
             // Resize bitmap to model input size
             val resizedBitmap = Bitmap.createScaledBitmap(bitmap, INPUT_SIZE, INPUT_SIZE, true)
             
             // Convert bitmap to ByteBuffer
             val inputBuffer = convertBitmapToByteBuffer(resizedBitmap)
             
-            // For demonstration purposes, create mock detections
-            // In a real implementation, you would run the actual model inference
-            val mockDetections = generateMockDetections(bitmap)
+            // Prepare output arrays for detection model
+            // Most detection models output: [locations, classes, scores, num_detections]
+            val outputLocations = Array(1) { Array(MAX_DETECTIONS) { FloatArray(4) } } // [batch, max_detections, 4] - bbox coordinates
+            val outputClasses = Array(1) { FloatArray(MAX_DETECTIONS) } // [batch, max_detections] - class indices
+            val outputScores = Array(1) { FloatArray(MAX_DETECTIONS) } // [batch, max_detections] - confidence scores
+            val outputNumDetections = FloatArray(1) // [batch] - number of valid detections
             
-            // Filter objects that are in the detection area (center of screen)
-            val centerX = bitmap.width / 2f
-            val centerY = bitmap.height / 2f
-            val detectionWidth = bitmap.width * 0.4f
-            val detectionHeight = bitmap.height * 0.3f
-            
-            val detectionRect = RectF(
-                centerX - detectionWidth / 2,
-                centerY - detectionHeight / 2,
-                centerX + detectionWidth / 2,
-                centerY + detectionHeight / 2
+            // Create output map
+            val outputMap = mapOf(
+                0 to outputLocations,
+                1 to outputClasses, 
+                2 to outputScores,
+                3 to outputNumDetections
             )
             
-            mockDetections.forEach { obj ->
-                if (RectF.intersects(obj.boundingBox, detectionRect)) {
-                    detectedObjects.add(obj)
+            // Run inference
+            interpreter.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputMap)
+            
+            // Process results
+            val numDetections = outputNumDetections[0].toInt().coerceAtMost(MAX_DETECTIONS)
+            
+            for (i in 0 until numDetections) {
+                val score = outputScores[0][i]
+                
+                if (score > DETECTION_THRESHOLD) {
+                    val classIndex = outputClasses[0][i].toInt()
+                    
+                    // Ensure class index is valid
+                    if (classIndex >= 0 && classIndex < labels.size) {
+                        val label = labels[classIndex]
+                        
+                        // Get bounding box coordinates (normalized 0-1)
+                        val top = outputLocations[0][i][0]
+                        val left = outputLocations[0][i][1] 
+                        val bottom = outputLocations[0][i][2]
+                        val right = outputLocations[0][i][3]
+                        
+                        // Convert to actual pixel coordinates
+                        val boundingBox = RectF(
+                            left * bitmap.width,
+                            top * bitmap.height,
+                            right * bitmap.width,
+                            bottom * bitmap.height
+                        )
+                        
+                        // Calculate approximate distance based on bounding box size
+                        val objectWidth = (right - left) * bitmap.width
+                        val distance = calculateDistance(objectWidth, label)
+                        
+                        detectedObjects.add(
+                            DetectedObject(
+                                label = label,
+                                confidence = score,
+                                boundingBox = boundingBox,
+                                distance = distance
+                            )
+                        )
+                        
+                        Log.d("TFLite", "Detected: $label (${(score * 100).toInt()}%) at distance ${String.format("%.1f", distance)}m")
+                    }
                 }
             }
             
         } catch (e: Exception) {
-            Log.e("TFLite", "Error during detection", e)
+            Log.e("TFLite", "Error during inference", e)
         }
         
         return detectedObjects
@@ -252,30 +316,79 @@ class TensorFlowObjectDetector(private val context: Context) {
         return byteBuffer
     }
     
-    private fun generateMockDetections(bitmap: Bitmap): List<DetectedObject> {
-        // Generate some mock detections for demonstration
-        // In a real app, this would come from actual model inference
-        val random = Random()
-        val detections = mutableListOf<DetectedObject>()
+    private fun calculateDistance(objectWidthPixels: Float, objectType: String): Float {
+        // Rough estimation based on typical object sizes (in meters)
+        val realWorldWidths = mapOf(
+            "person" to 0.5f,          // Average shoulder width
+            "car" to 1.8f,             // Average car width
+            "bicycle" to 0.6f,         // Average bicycle width
+            "motorcycle" to 0.8f,      // Average motorcycle width
+            "bus" to 2.5f,             // Average bus width
+            "truck" to 2.4f,           // Average truck width
+            "bottle" to 0.07f,         // Average bottle diameter
+            "wine glass" to 0.08f,     // Average wine glass diameter
+            "cup" to 0.09f,            // Average cup diameter
+            "fork" to 0.02f,           // Average fork width
+            "knife" to 0.025f,         // Average knife width
+            "spoon" to 0.04f,          // Average spoon width
+            "bowl" to 0.15f,           // Average bowl diameter
+            "chair" to 0.5f,           // Average chair width
+            "couch" to 1.8f,           // Average couch width
+            "dining table" to 1.2f,    // Average table width
+            "tv" to 1.0f,              // Average TV width
+            "laptop" to 0.35f,         // Average laptop width
+            "cell phone" to 0.08f,     // Average phone width
+            "book" to 0.15f,           // Average book width
+            "clock" to 0.3f,           // Average wall clock diameter
+            "backpack" to 0.4f,        // Average backpack width
+            "handbag" to 0.3f,         // Average handbag width
+            "suitcase" to 0.4f,        // Average suitcase width
+            "umbrella" to 0.1f,        // Average umbrella diameter when closed
+            "sports ball" to 0.22f,    // Average basketball diameter
+            "tennis racket" to 0.27f,  // Average racket width
+            "baseball bat" to 0.07f,   // Average bat diameter
+            "skateboard" to 0.2f,      // Average skateboard width
+            "surfboard" to 0.55f,      // Average surfboard width
+            "banana" to 0.03f,         // Average banana width
+            "apple" to 0.08f,          // Average apple diameter
+            "orange" to 0.08f,         // Average orange diameter
+            "pizza" to 0.3f,           // Average pizza diameter
+            "donut" to 0.1f,           // Average donut diameter
+            "cake" to 0.25f,           // Average cake diameter
+            "potted plant" to 0.2f,    // Average pot diameter
+            "vase" to 0.15f,           // Average vase diameter
+            "teddy bear" to 0.3f,      // Average teddy bear width
+            "mouse" to 0.06f,          // Computer mouse width
+            "keyboard" to 0.45f,       // Average keyboard width
+            "remote" to 0.05f,         // TV remote width
+            "microwave" to 0.5f,       // Average microwave width
+            "oven" to 0.6f,            // Average oven width
+            "toaster" to 0.3f,         // Average toaster width
+            "sink" to 0.6f,            // Average sink width
+            "refrigerator" to 0.7f,    // Average refrigerator width
+            "toilet" to 0.4f,          // Average toilet width
+            "bed" to 1.4f,             // Average bed width
+            "bench" to 1.2f,           // Average bench width
+            "bird" to 0.15f,           // Average bird wingspan (small birds)
+            "cat" to 0.25f,            // Average cat width
+            "dog" to 0.4f,             // Average dog width
+            "horse" to 1.0f,           // Average horse width
+            "sheep" to 0.4f,           // Average sheep width
+            "cow" to 0.8f,             // Average cow width
+            "elephant" to 2.5f,        // Average elephant width
+            "bear" to 1.0f,            // Average bear width
+            "zebra" to 0.8f,           // Average zebra width
+            "giraffe" to 1.2f          // Average giraffe width (body)
+        )
         
-        // Add some random detections
-        if (random.nextFloat() > 0.3f) {
-            detections.add(
-                DetectedObject(
-                    label = labels[random.nextInt(min(10, labels.size))], // Use first 10 common objects
-                    confidence = 0.7f + random.nextFloat() * 0.25f,
-                    boundingBox = RectF(
-                        random.nextFloat() * bitmap.width * 0.3f,
-                        random.nextFloat() * bitmap.height * 0.3f,
-                        random.nextFloat() * bitmap.width * 0.3f + bitmap.width * 0.4f,
-                        random.nextFloat() * bitmap.height * 0.3f + bitmap.height * 0.4f
-                    ),
-                    distance = 1.0f + random.nextFloat() * 4.0f
-                )
-            )
+        val assumedRealWidth = realWorldWidths[objectType] ?: ARDetectionConfig.DEFAULT_OBJECT_WIDTH_M
+        val focalLength = ARDetectionConfig.CAMERA_FOCAL_LENGTH_PX
+        
+        return if (objectWidthPixels > 0) {
+            (assumedRealWidth * focalLength) / objectWidthPixels
+        } else {
+            0f
         }
-        
-        return detections
     }
     
     fun close() {
@@ -286,11 +399,11 @@ class TensorFlowObjectDetector(private val context: Context) {
 @Composable
 fun TiltIndicator(
     currentAngle: Float,
-    targetAngle: Float = 45f,
+    targetAngle: Float = ARDetectionConfig.TARGET_ANGLE,
     isAvailable: Boolean = true,
     modifier: Modifier = Modifier
 ) {
-    val isCorrectAngle = abs(currentAngle - targetAngle) < 5f // 5° tolerance
+    val isCorrectAngle = abs(currentAngle - targetAngle) < ARDetectionConfig.ANGLE_TOLERANCE
     val indicatorColor = if (!isAvailable) Color.Gray else if (isCorrectAngle) Color.Green else Color.Red
     
     Column(
@@ -403,7 +516,7 @@ fun TiltIndicator(
             text = when {
                 !isAvailable -> "⚠ NO SENSOR"
                 isCorrectAngle -> "✓ CORRECT"
-                else -> "↗ TILT TO 45°"
+                else -> "↗ TILT TO ${ARDetectionConfig.TARGET_ANGLE.toInt()}°"
             },
             color = indicatorColor,
             fontSize = 10.sp,
@@ -435,8 +548,8 @@ fun ARObjectDetectionScreen() {
     var lastDetectionTime by remember { mutableStateOf(0L) }
     var isSensorAvailable by remember { mutableStateOf(true) }
     
-    val targetAngle = 45f
-    val isCorrectAngle = isSensorAvailable && abs(currentTiltAngle - targetAngle) < 5f
+    val targetAngle = ARDetectionConfig.TARGET_ANGLE
+    val isCorrectAngle = isSensorAvailable && abs(currentTiltAngle - targetAngle) < ARDetectionConfig.ANGLE_TOLERANCE
     val detectionZoneColor = if (!isSensorAvailable) Color.Gray else if (isCorrectAngle) Color.Green else Color.Red
     
     // Initialize object detector
@@ -479,12 +592,12 @@ fun ARObjectDetectionScreen() {
                 onSessionUpdated = { arSceneView, arFrame ->
                     // Handle each AR frame
                     currentFrame = arFrame
-                    
+
                     // Perform object detection only every 3 seconds and when angle is correct (or sensor unavailable)
                     val currentTime = System.currentTimeMillis()
                     if (!isDetecting && 
                         (isCorrectAngle || !isSensorAvailable) && 
-                        (currentTime - lastDetectionTime) > 3000) {
+                        (currentTime - lastDetectionTime) > ARDetectionConfig.DETECTION_INTERVAL_MS) {
                         
                         isDetecting = true
                         lastDetectionTime = currentTime
@@ -524,7 +637,7 @@ fun ARObjectDetectionScreen() {
                     text = when {
                         !isSensorAvailable -> "⚠ SENSOR NOT AVAILABLE"
                         isCorrectAngle -> "✓ DETECTION ZONE"
-                        else -> "↗ TILT TO 45°"
+                        else -> "↗ TILT TO ${ARDetectionConfig.TARGET_ANGLE.toInt()}°"
                     },
                     color = detectionZoneColor,
                     fontSize = 14.sp,
@@ -647,7 +760,7 @@ fun ARObjectDetectionScreen() {
                             }
                         }
                     } else {
-                        Toast.makeText(context, "Please tilt device to 45° first", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "Please tilt device to ${ARDetectionConfig.TARGET_ANGLE.toInt()}° first", Toast.LENGTH_SHORT).show()
                     }
                 },
                 modifier = Modifier
@@ -666,10 +779,10 @@ fun ARObjectDetectionScreen() {
             Text(
                 text = when {
                     !isSensorAvailable -> "Device has no tilt sensor - detection always active"
-                    !isCorrectAngle -> "Tilt device to 45° for detection"
+                    !isCorrectAngle -> "Tilt device to ${ARDetectionConfig.TARGET_ANGLE.toInt()}° for detection"
                     detectedObjects.isNotEmpty() -> "${detectedObjects.size} objects detected"
                     isDetecting -> "Scanning..."
-                    else -> "Hold steady - scanning every 3 seconds"
+                    else -> "Hold steady - scanning every ${ARDetectionConfig.DETECTION_INTERVAL_MS / 1000} seconds"
                 },
                 modifier = Modifier
                     .align(Alignment.TopCenter)
@@ -735,10 +848,30 @@ private suspend fun performObjectDetection(
             val image = frame.acquireCameraImage()
             image?.let { cameraImage ->
                 val bitmap = imageProxyToBitmap(cameraImage)
-                val detectedObjects = detector?.detectObjects(bitmap) ?: emptyList()
+                val allDetectedObjects = detector?.detectObjects(bitmap) ?: emptyList()
+                
+                // Filter objects that are in the detection area (center of screen)
+                val centerX = bitmap.width / 2f
+                val centerY = bitmap.height / 2f
+                val detectionWidth = bitmap.width * ARDetectionConfig.DETECTION_ZONE_WIDTH_RATIO
+                val detectionHeight = bitmap.height * ARDetectionConfig.DETECTION_ZONE_HEIGHT_RATIO
+                
+                val detectionRect = RectF(
+                    centerX - detectionWidth / 2,
+                    centerY - detectionHeight / 2,
+                    centerX + detectionWidth / 2,
+                    centerY + detectionHeight / 2
+                )
+                
+                // Only include objects that intersect with the detection zone
+                val filteredObjects = allDetectedObjects.filter { obj ->
+                    RectF.intersects(obj.boundingBox, detectionRect)
+                }
+                
+                Log.d("AR Detection", "Total detected: ${allDetectedObjects.size}, In zone: ${filteredObjects.size}")
                 
                 withContext(Dispatchers.Main) {
-                    onObjectsDetected(detectedObjects)
+                    onObjectsDetected(filteredObjects)
                 }
                 
                 cameraImage.close()
