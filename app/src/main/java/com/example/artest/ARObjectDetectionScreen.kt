@@ -87,6 +87,10 @@ object ARDetectionConfig {
     // Distance calculation
     const val CAMERA_FOCAL_LENGTH_PX = 800f // Approximate focal length in pixels
     const val DEFAULT_OBJECT_WIDTH_M = 0.3f // Default object width for unknown objects (30cm)
+    
+    // ARCore hit test configuration
+    const val HIT_TEST_MAX_DISTANCE = 10f   // Maximum distance for hit test (10 meters)
+    const val USE_ARCORE_DISTANCE = true    // Enable/disable ARCore distance measurement
 }
 
 class TiltSensorManager(
@@ -271,20 +275,18 @@ class TensorFlowObjectDetector(private val context: Context) {
                             bottom * bitmap.height
                         )
                         
-                        // Calculate approximate distance based on bounding box size
-                        val objectWidth = (right - left) * bitmap.width
-                        val distance = calculateDistance(objectWidth, label)
-                        
+                        // Store object without distance calculation for now
+                        // Distance will be calculated later using ARCore hitTest
                         detectedObjects.add(
                             DetectedObject(
                                 label = label,
                                 confidence = score,
                                 boundingBox = boundingBox,
-                                distance = distance
+                                distance = 0f // Will be updated with ARCore measurement
                             )
                         )
                         
-                        Log.d("TFLite", "Detected: $label (${(score * 100).toInt()}%) at distance ${String.format("%.1f", distance)}m")
+                        Log.d("TFLite", "Detected: $label (${(score * 100).toInt()}%) - distance will be calculated with ARCore")
                     }
                 }
             }
@@ -317,7 +319,9 @@ class TensorFlowObjectDetector(private val context: Context) {
     }
     
     private fun calculateDistance(objectWidthPixels: Float, objectType: String): Float {
-        // Rough estimation based on typical object sizes (in meters)
+        // This is a fallback estimation method
+        // Real distance should be calculated using ARCore hitTest/raycast
+        // This method is kept for objects where ARCore measurement fails
         val realWorldWidths = mapOf(
             "person" to 0.5f,          // Average shoulder width
             "car" to 1.8f,             // Average car width
@@ -328,10 +332,6 @@ class TensorFlowObjectDetector(private val context: Context) {
             "bottle" to 0.07f,         // Average bottle diameter
             "wine glass" to 0.08f,     // Average wine glass diameter
             "cup" to 0.09f,            // Average cup diameter
-            "fork" to 0.02f,           // Average fork width
-            "knife" to 0.025f,         // Average knife width
-            "spoon" to 0.04f,          // Average spoon width
-            "bowl" to 0.15f,           // Average bowl diameter
             "chair" to 0.5f,           // Average chair width
             "couch" to 1.8f,           // Average couch width
             "dining table" to 1.2f,    // Average table width
@@ -339,46 +339,6 @@ class TensorFlowObjectDetector(private val context: Context) {
             "laptop" to 0.35f,         // Average laptop width
             "cell phone" to 0.08f,     // Average phone width
             "book" to 0.15f,           // Average book width
-            "clock" to 0.3f,           // Average wall clock diameter
-            "backpack" to 0.4f,        // Average backpack width
-            "handbag" to 0.3f,         // Average handbag width
-            "suitcase" to 0.4f,        // Average suitcase width
-            "umbrella" to 0.1f,        // Average umbrella diameter when closed
-            "sports ball" to 0.22f,    // Average basketball diameter
-            "tennis racket" to 0.27f,  // Average racket width
-            "baseball bat" to 0.07f,   // Average bat diameter
-            "skateboard" to 0.2f,      // Average skateboard width
-            "surfboard" to 0.55f,      // Average surfboard width
-            "banana" to 0.03f,         // Average banana width
-            "apple" to 0.08f,          // Average apple diameter
-            "orange" to 0.08f,         // Average orange diameter
-            "pizza" to 0.3f,           // Average pizza diameter
-            "donut" to 0.1f,           // Average donut diameter
-            "cake" to 0.25f,           // Average cake diameter
-            "potted plant" to 0.2f,    // Average pot diameter
-            "vase" to 0.15f,           // Average vase diameter
-            "teddy bear" to 0.3f,      // Average teddy bear width
-            "mouse" to 0.06f,          // Computer mouse width
-            "keyboard" to 0.45f,       // Average keyboard width
-            "remote" to 0.05f,         // TV remote width
-            "microwave" to 0.5f,       // Average microwave width
-            "oven" to 0.6f,            // Average oven width
-            "toaster" to 0.3f,         // Average toaster width
-            "sink" to 0.6f,            // Average sink width
-            "refrigerator" to 0.7f,    // Average refrigerator width
-            "toilet" to 0.4f,          // Average toilet width
-            "bed" to 1.4f,             // Average bed width
-            "bench" to 1.2f,           // Average bench width
-            "bird" to 0.15f,           // Average bird wingspan (small birds)
-            "cat" to 0.25f,            // Average cat width
-            "dog" to 0.4f,             // Average dog width
-            "horse" to 1.0f,           // Average horse width
-            "sheep" to 0.4f,           // Average sheep width
-            "cow" to 0.8f,             // Average cow width
-            "elephant" to 2.5f,        // Average elephant width
-            "bear" to 1.0f,            // Average bear width
-            "zebra" to 0.8f,           // Average zebra width
-            "giraffe" to 1.2f          // Average giraffe width (body)
         )
         
         val assumedRealWidth = realWorldWidths[objectType] ?: ARDetectionConfig.DEFAULT_OBJECT_WIDTH_M
@@ -388,6 +348,93 @@ class TensorFlowObjectDetector(private val context: Context) {
             (assumedRealWidth * focalLength) / objectWidthPixels
         } else {
             0f
+        }
+    }
+    
+    // Update detected objects with ARCore distance measurements
+    fun updateObjectsWithARCoreDistances(
+        frame: Frame,
+        detectedObjects: List<DetectedObject>,
+        imageWidth: Int,
+        imageHeight: Int
+    ): List<DetectedObject> {
+        return detectedObjects.map { obj ->
+            // Calculate center point of the object's bounding box
+            val centerX = (obj.boundingBox.left + obj.boundingBox.right) / 2f
+            val centerY = (obj.boundingBox.top + obj.boundingBox.bottom) / 2f
+            
+            // Normalize coordinates to screen space (0-1)
+            val normalizedX = centerX / imageWidth
+            val normalizedY = centerY / imageHeight
+            
+            // Convert to screen coordinates (assuming full screen AR view)
+            // This would need to be adjusted based on actual view dimensions
+            val screenX = normalizedX * imageWidth
+            val screenY = normalizedY * imageHeight
+            
+            // Calculate ARCore distance
+            val arcoreDistance = calculateARCoreDistance(frame, screenX, screenY)
+            
+            // Use ARCore distance if available, otherwise fallback to estimation
+            val finalDistance = if (arcoreDistance > 0) {
+                arcoreDistance
+            } else {
+                // Fallback to size-based estimation
+                val objectWidth = obj.boundingBox.width()
+                calculateDistance(objectWidth, obj.label)
+            }
+            
+            // Return updated object with real distance
+            obj.copy(distance = finalDistance)
+        }
+    }
+    
+    // Calculate real distance using ARCore hitTest
+    fun calculateARCoreDistance(
+        frame: Frame,
+        screenX: Float,
+        screenY: Float
+    ): Float {
+        return try {
+            // Only use ARCore distance if enabled in config
+            if (!ARDetectionConfig.USE_ARCORE_DISTANCE) {
+                return -1f
+            }
+            
+            // Perform hit test at the object's center point
+            val hits = frame.hitTest(screenX, screenY)
+            
+            if (hits.isNotEmpty()) {
+                // Get the closest hit result
+                val hit = hits[0]
+                val hitPose = hit.hitPose
+                
+                // Get camera pose
+                val cameraPose = frame.camera.pose
+                
+                // Calculate distance between camera and hit point
+                val dx = hitPose.tx() - cameraPose.tx()
+                val dy = hitPose.ty() - cameraPose.ty() 
+                val dz = hitPose.tz() - cameraPose.tz()
+                
+                val distance = sqrt(dx * dx + dy * dy + dz * dz)
+                
+                // Validate distance is within reasonable range
+                if (distance > 0 && distance <= ARDetectionConfig.HIT_TEST_MAX_DISTANCE) {
+                    Log.d("ARCore Distance", "Hit test successful: ${String.format("%.2f", distance)}m at (${screenX}, ${screenY})")
+                    distance
+                } else {
+                    Log.w("ARCore Distance", "Distance out of range: ${String.format("%.2f", distance)}m")
+                    -1f
+                }
+            } else {
+                Log.d("ARCore Distance", "No hit detected at (${screenX}, ${screenY})")
+                // No hit detected, return -1 to indicate failure
+                -1f
+            }
+        } catch (e: Exception) {
+            Log.e("ARCore Distance", "Error calculating ARCore distance", e)
+            -1f
         }
     }
     
@@ -848,7 +895,14 @@ private suspend fun performObjectDetection(
             val image = frame.acquireCameraImage()
             image?.let { cameraImage ->
                 val bitmap = imageProxyToBitmap(cameraImage)
-                val allDetectedObjects = detector?.detectObjects(bitmap) ?: emptyList()
+                
+                // Get initial detections (without distance)
+                val initialDetections = detector?.detectObjects(bitmap) ?: emptyList()
+                
+                // Update detections with ARCore distance measurements
+                val detectionsWithDistance = detector?.updateObjectsWithARCoreDistances(
+                    frame, initialDetections, bitmap.width, bitmap.height
+                ) ?: emptyList()
                 
                 // Filter objects that are in the detection area (center of screen)
                 val centerX = bitmap.width / 2f
@@ -864,11 +918,16 @@ private suspend fun performObjectDetection(
                 )
                 
                 // Only include objects that intersect with the detection zone
-                val filteredObjects = allDetectedObjects.filter { obj ->
+                val filteredObjects = detectionsWithDistance.filter { obj ->
                     RectF.intersects(obj.boundingBox, detectionRect)
                 }
                 
-                Log.d("AR Detection", "Total detected: ${allDetectedObjects.size}, In zone: ${filteredObjects.size}")
+                Log.d("AR Detection", "Total detected: ${detectionsWithDistance.size}, In zone: ${filteredObjects.size}")
+                
+                // Log distance measurements for debugging
+                filteredObjects.forEach { obj ->
+                    Log.d("AR Distance", "${obj.label}: ${String.format("%.2f", obj.distance)}m")
+                }
                 
                 withContext(Dispatchers.Main) {
                     onObjectsDetected(filteredObjects)
