@@ -369,7 +369,6 @@ fun TiltIndicator(
 @Composable
 fun ARObjectDetectionScreen() {
     val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
     val cameraPermissionState = rememberPermissionState(android.Manifest.permission.CAMERA)
     val coroutineScope = rememberCoroutineScope()
     
@@ -382,7 +381,7 @@ fun ARObjectDetectionScreen() {
     var tiltSensorManager by remember { mutableStateOf<TiltSensorManager?>(null) }
     var lastDetectionTime by remember { mutableStateOf(0L) }
     
-    val targetAngle = 45f
+    val targetAngle = -45f
     val isCorrectAngle = abs(currentTiltAngle - targetAngle) < 5f
     val detectionZoneColor = if (isCorrectAngle) Color.Green else Color.Red
     
