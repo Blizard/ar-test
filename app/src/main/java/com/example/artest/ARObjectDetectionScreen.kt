@@ -7,14 +7,20 @@ import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.YuvImage
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.media.Image
 import android.os.Environment
 import android.util.Log
 import android.widget.Toast
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Star
@@ -22,7 +28,13 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -36,6 +48,7 @@ import com.google.accompanist.permissions.rememberPermissionState
 import com.google.ar.core.*
 import io.github.sceneview.ar.ARScene
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.tensorflow.lite.Interpreter
@@ -48,7 +61,7 @@ import java.nio.ByteOrder
 import java.nio.channels.FileChannel
 import java.text.SimpleDateFormat
 import java.util.*
-import kotlin.math.min
+import kotlin.math.*
 
 data class DetectedObject(
     val label: String,
@@ -56,6 +69,60 @@ data class DetectedObject(
     val boundingBox: RectF,
     val distance: Float
 )
+
+class TiltSensorManager(
+    private val context: Context,
+    private val onTiltChanged: (Float) -> Unit
+) : SensorEventListener {
+    
+    private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+    private val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+    private val magnetometer = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
+    
+    private val accelerometerReading = FloatArray(3)
+    private val magnetometerReading = FloatArray(3)
+    private val rotationMatrix = FloatArray(9)
+    private val orientationAngles = FloatArray(3)
+    
+    fun startListening() {
+        accelerometer?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
+        }
+        magnetometer?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
+        }
+    }
+    
+    fun stopListening() {
+        sensorManager.unregisterListener(this)
+    }
+    
+    override fun onSensorChanged(event: SensorEvent?) {
+        event?.let {
+            when (it.sensor?.type) {
+                Sensor.TYPE_ACCELEROMETER -> {
+                    System.arraycopy(it.values, 0, accelerometerReading, 0, accelerometerReading.size)
+                }
+                Sensor.TYPE_MAGNETIC_FIELD -> {
+                    System.arraycopy(it.values, 0, magnetometerReading, 0, magnetometerReading.size)
+                }
+            }
+            
+            // Calculate orientation
+            SensorManager.getRotationMatrix(
+                rotationMatrix, null,
+                accelerometerReading, magnetometerReading
+            )
+            SensorManager.getOrientation(rotationMatrix, orientationAngles)
+            
+            // Convert pitch to degrees (orientationAngles[1] is pitch in radians)
+            val pitchDegrees = Math.toDegrees(orientationAngles[1].toDouble()).toFloat()
+            onTiltChanged(pitchDegrees)
+        }
+    }
+    
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+}
 
 class TensorFlowObjectDetector(private val context: Context) {
     private var interpreter: Interpreter? = null
@@ -199,6 +266,105 @@ class TensorFlowObjectDetector(private val context: Context) {
     }
 }
 
+@Composable
+fun TiltIndicator(
+    currentAngle: Float,
+    targetAngle: Float = 45f,
+    modifier: Modifier = Modifier
+) {
+    val isCorrectAngle = abs(currentAngle - targetAngle) < 5f // 5° tolerance
+    val indicatorColor = if (isCorrectAngle) Color.Green else Color.Red
+    
+    Column(
+        modifier = modifier,
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        // Visual tilt indicator
+        Box(
+            modifier = Modifier
+                .size(80.dp)
+                .background(
+                    Color.Black.copy(alpha = 0.7f),
+                    CircleShape
+                )
+                .padding(8.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val center = Offset(size.width / 2, size.height / 2)
+                val radius = size.minDimension / 2 - 8.dp.toPx()
+                
+                // Draw circle background
+                drawCircle(
+                    color = Color.Gray.copy(alpha = 0.3f),
+                    radius = radius,
+                    center = center,
+                    style = Stroke(width = 4.dp.toPx())
+                )
+                
+                // Draw target angle indicator (45°)
+                val targetAngleRad = Math.toRadians((targetAngle - 90).toDouble())
+                val targetX = center.x + radius * cos(targetAngleRad).toFloat()
+                val targetY = center.y + radius * sin(targetAngleRad).toFloat()
+                
+                drawCircle(
+                    color = Color.Green,
+                    radius = 6.dp.toPx(),
+                    center = Offset(targetX, targetY)
+                )
+                
+                // Draw current angle indicator
+                val currentAngleRad = Math.toRadians((currentAngle - 90).toDouble())
+                val currentX = center.x + radius * cos(currentAngleRad).toFloat()
+                val currentY = center.y + radius * sin(currentAngleRad).toFloat()
+                
+                drawCircle(
+                    color = indicatorColor,
+                    radius = 8.dp.toPx(),
+                    center = Offset(currentX, currentY)
+                )
+                
+                // Draw center dot
+                drawCircle(
+                    color = Color.White,
+                    radius = 3.dp.toPx(),
+                    center = center
+                )
+            }
+        }
+        
+        Spacer(modifier = Modifier.height(8.dp))
+        
+        // Angle text
+        Text(
+            text = "${currentAngle.roundToInt()}°",
+            color = indicatorColor,
+            fontSize = 16.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier
+                .background(
+                    Color.Black.copy(alpha = 0.7f),
+                    RoundedCornerShape(8.dp)
+                )
+                .padding(horizontal = 12.dp, vertical = 4.dp)
+        )
+        
+        // Status text
+        Text(
+            text = if (isCorrectAngle) "✓ CORRECT" else "↗ TILT TO 45°",
+            color = indicatorColor,
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier
+                .background(
+                    Color.Black.copy(alpha = 0.7f),
+                    RoundedCornerShape(4.dp)
+                )
+                .padding(horizontal = 8.dp, vertical = 2.dp)
+        )
+    }
+}
+
 @OptIn(ExperimentalPermissionsApi::class)
 @Composable
 fun ARObjectDetectionScreen() {
@@ -212,16 +378,32 @@ fun ARObjectDetectionScreen() {
     var objectDetector by remember { mutableStateOf<TensorFlowObjectDetector?>(null) }
     var arSession by remember { mutableStateOf<Session?>(null) }
     var currentFrame by remember { mutableStateOf<Frame?>(null) }
+    var currentTiltAngle by remember { mutableStateOf(0f) }
+    var tiltSensorManager by remember { mutableStateOf<TiltSensorManager?>(null) }
+    var lastDetectionTime by remember { mutableStateOf(0L) }
+    
+    val targetAngle = 45f
+    val isCorrectAngle = abs(currentTiltAngle - targetAngle) < 5f
+    val detectionZoneColor = if (isCorrectAngle) Color.Green else Color.Red
     
     // Initialize object detector
     LaunchedEffect(Unit) {
         objectDetector = TensorFlowObjectDetector(context)
     }
     
-    // Clean up detector
+    // Initialize tilt sensor
+    LaunchedEffect(Unit) {
+        tiltSensorManager = TiltSensorManager(context) { angle ->
+            currentTiltAngle = angle
+        }
+        tiltSensorManager?.startListening()
+    }
+    
+    // Clean up
     DisposableEffect(Unit) {
         onDispose {
             objectDetector?.close()
+            tiltSensorManager?.stopListening()
         }
     }
     
@@ -243,9 +425,15 @@ fun ARObjectDetectionScreen() {
                     // Handle each AR frame
                     currentFrame = arFrame
                     
-                    // Perform object detection periodically
-                    if (!isDetecting) {
+                    // Perform object detection only every 3 seconds and when angle is correct
+                    val currentTime = System.currentTimeMillis()
+                    if (!isDetecting && 
+                        isCorrectAngle && 
+                        (currentTime - lastDetectionTime) > 3000) {
+                        
                         isDetecting = true
+                        lastDetectionTime = currentTime
+                        
                         coroutineScope.launch {
                             performObjectDetection(arFrame, objectDetector) { objects ->
                                 detectedObjects = objects
@@ -256,20 +444,29 @@ fun ARObjectDetectionScreen() {
                 }
             )
             
-            // Detection rectangle overlay
+            // Tilt indicator (top right)
+            TiltIndicator(
+                currentAngle = currentTiltAngle,
+                targetAngle = targetAngle,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(16.dp)
+            )
+            
+            // Detection rectangle overlay with dynamic color
             Box(
                 modifier = Modifier
                     .size(250.dp, 180.dp)
                     .align(Alignment.Center)
                     .border(
                         3.dp,
-                        Color.Red,
+                        detectionZoneColor,
                         RoundedCornerShape(12.dp)
                     )
             ) {
                 Text(
-                    text = "DETECTION ZONE",
-                    color = Color.Red,
+                    text = if (isCorrectAngle) "✓ DETECTION ZONE" else "↗ TILT TO 45°",
+                    color = detectionZoneColor,
                     fontSize = 14.sp,
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier
@@ -282,7 +479,7 @@ fun ARObjectDetectionScreen() {
                 )
             }
             
-            // Detected objects info panel
+            // Detected objects info panel (only show for longer duration)
             if (detectedObjects.isNotEmpty()) {
                 LazyColumn(
                     modifier = Modifier
@@ -296,6 +493,33 @@ fun ARObjectDetectionScreen() {
                         .widthIn(max = 220.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+                    // Header with detection info
+                    item {
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(
+                                containerColor = Color.Blue.copy(alpha = 0.9f)
+                            ),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(12.dp)
+                            ) {
+                                Text(
+                                    text = "DETECTION RESULTS",
+                                    color = Color.White,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    text = "Next scan in 3s",
+                                    color = Color.White.copy(alpha = 0.7f),
+                                    fontSize = 10.sp
+                                )
+                            }
+                        }
+                    }
+                    
                     items(detectedObjects.size) { index ->
                         val obj = detectedObjects[index]
                         Card(
@@ -353,19 +577,23 @@ fun ARObjectDetectionScreen() {
                 }
             }
             
-            // Camera capture button
+            // Camera capture button (only enabled when angle is correct)
             FloatingActionButton(
                 onClick = {
-                    coroutineScope.launch {
-                        currentFrame?.let { frame ->
-                            capturePhoto(frame, context)
+                    if (isCorrectAngle) {
+                        coroutineScope.launch {
+                            currentFrame?.let { frame ->
+                                capturePhoto(frame, context)
+                            }
                         }
+                    } else {
+                        Toast.makeText(context, "Please tilt device to 45° first", Toast.LENGTH_SHORT).show()
                     }
                 },
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .padding(32.dp),
-                containerColor = MaterialTheme.colorScheme.primary
+                containerColor = if (isCorrectAngle) MaterialTheme.colorScheme.primary else Color.Gray
             ) {
                 Icon(
                     imageVector = Icons.Default.Star,
@@ -376,12 +604,11 @@ fun ARObjectDetectionScreen() {
             
             // Status text
             Text(
-                text = if (detectedObjects.isNotEmpty()) {
-                    "${detectedObjects.size} objects detected"
-                } else if (isDetecting) {
-                    "Analyzing..."
-                } else {
-                    "Point camera at objects in the red zone"
+                text = when {
+                    !isCorrectAngle -> "Tilt device to 45° for detection"
+                    detectedObjects.isNotEmpty() -> "${detectedObjects.size} objects detected"
+                    isDetecting -> "Scanning..."
+                    else -> "Hold steady - scanning every 3 seconds"
                 },
                 modifier = Modifier
                     .align(Alignment.TopCenter)
