@@ -72,7 +72,8 @@ data class DetectedObject(
 
 class TiltSensorManager(
     private val context: Context,
-    private val onTiltChanged: (Float) -> Unit
+    private val onTiltChanged: (Float) -> Unit,
+    private val onSensorAvailabilityChanged: (Boolean) -> Unit
 ) : SensorEventListener {
     
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -84,12 +85,28 @@ class TiltSensorManager(
     private val rotationMatrix = FloatArray(9)
     private val orientationAngles = FloatArray(3)
     
+    val isSensorAvailable: Boolean
+        get() = accelerometer != null && magnetometer != null
+    
     fun startListening() {
-        accelerometer?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
+        if (!isSensorAvailable) {
+            Log.w("TiltSensor", "Accelerometer or magnetometer not available")
+            onSensorAvailabilityChanged(false)
+            return
         }
-        magnetometer?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
+        
+        val accelerometerRegistered = sensorManager.registerListener(
+            this, accelerometer, SensorManager.SENSOR_DELAY_UI
+        )
+        val magnetometerRegistered = sensorManager.registerListener(
+            this, magnetometer, SensorManager.SENSOR_DELAY_UI
+        )
+        
+        val sensorsRegistered = accelerometerRegistered && magnetometerRegistered
+        onSensorAvailabilityChanged(sensorsRegistered)
+        
+        if (!sensorsRegistered) {
+            Log.w("TiltSensor", "Failed to register sensor listeners")
         }
     }
     
@@ -270,10 +287,11 @@ class TensorFlowObjectDetector(private val context: Context) {
 fun TiltIndicator(
     currentAngle: Float,
     targetAngle: Float = 45f,
+    isAvailable: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     val isCorrectAngle = abs(currentAngle - targetAngle) < 5f // 5° tolerance
-    val indicatorColor = if (isCorrectAngle) Color.Green else Color.Red
+    val indicatorColor = if (!isAvailable) Color.Gray else if (isCorrectAngle) Color.Green else Color.Red
     
     Column(
         modifier = modifier,
@@ -290,54 +308,85 @@ fun TiltIndicator(
                 .padding(8.dp),
             contentAlignment = Alignment.Center
         ) {
-            Canvas(modifier = Modifier.fillMaxSize()) {
-                val center = Offset(size.width / 2, size.height / 2)
-                val radius = size.minDimension / 2 - 8.dp.toPx()
-                
-                // Draw circle background
-                drawCircle(
-                    color = Color.Gray.copy(alpha = 0.3f),
-                    radius = radius,
-                    center = center,
-                    style = Stroke(width = 4.dp.toPx())
-                )
-                
-                // Draw target angle indicator (45°)
-                val targetAngleRad = Math.toRadians((targetAngle - 90).toDouble())
-                val targetX = center.x + radius * cos(targetAngleRad).toFloat()
-                val targetY = center.y + radius * sin(targetAngleRad).toFloat()
-                
-                drawCircle(
-                    color = Color.Green,
-                    radius = 6.dp.toPx(),
-                    center = Offset(targetX, targetY)
-                )
-                
-                // Draw current angle indicator
-                val currentAngleRad = Math.toRadians((currentAngle - 90).toDouble())
-                val currentX = center.x + radius * cos(currentAngleRad).toFloat()
-                val currentY = center.y + radius * sin(currentAngleRad).toFloat()
-                
-                drawCircle(
-                    color = indicatorColor,
-                    radius = 8.dp.toPx(),
-                    center = Offset(currentX, currentY)
-                )
-                
-                // Draw center dot
-                drawCircle(
-                    color = Color.White,
-                    radius = 3.dp.toPx(),
-                    center = center
-                )
+            if (!isAvailable) {
+                // Show "X" when sensors not available
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    val center = Offset(size.width / 2, size.height / 2)
+                    val radius = size.minDimension / 2 - 8.dp.toPx()
+                    
+                    // Draw circle background
+                    drawCircle(
+                        color = Color.Gray.copy(alpha = 0.3f),
+                        radius = radius,
+                        center = center,
+                        style = Stroke(width = 4.dp.toPx())
+                    )
+                    
+                    // Draw X
+                    val lineLength = radius * 0.6f
+                    drawLine(
+                        color = Color.Red,
+                        start = Offset(center.x - lineLength, center.y - lineLength),
+                        end = Offset(center.x + lineLength, center.y + lineLength),
+                        strokeWidth = 4.dp.toPx()
+                    )
+                    drawLine(
+                        color = Color.Red,
+                        start = Offset(center.x + lineLength, center.y - lineLength),
+                        end = Offset(center.x - lineLength, center.y + lineLength),
+                        strokeWidth = 4.dp.toPx()
+                    )
+                }
+            } else {
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    val center = Offset(size.width / 2, size.height / 2)
+                    val radius = size.minDimension / 2 - 8.dp.toPx()
+                    
+                    // Draw circle background
+                    drawCircle(
+                        color = Color.Gray.copy(alpha = 0.3f),
+                        radius = radius,
+                        center = center,
+                        style = Stroke(width = 4.dp.toPx())
+                    )
+                    
+                    // Draw target angle indicator (45°)
+                    val targetAngleRad = Math.toRadians((targetAngle - 90).toDouble())
+                    val targetX = center.x + radius * cos(targetAngleRad).toFloat()
+                    val targetY = center.y + radius * sin(targetAngleRad).toFloat()
+                    
+                    drawCircle(
+                        color = Color.Green,
+                        radius = 6.dp.toPx(),
+                        center = Offset(targetX, targetY)
+                    )
+                    
+                    // Draw current angle indicator
+                    val currentAngleRad = Math.toRadians((currentAngle - 90).toDouble())
+                    val currentX = center.x + radius * cos(currentAngleRad).toFloat()
+                    val currentY = center.y + radius * sin(currentAngleRad).toFloat()
+                    
+                    drawCircle(
+                        color = indicatorColor,
+                        radius = 8.dp.toPx(),
+                        center = Offset(currentX, currentY)
+                    )
+                    
+                    // Draw center dot
+                    drawCircle(
+                        color = Color.White,
+                        radius = 3.dp.toPx(),
+                        center = center
+                    )
+                }
             }
         }
         
         Spacer(modifier = Modifier.height(8.dp))
         
-        // Angle text
+        // Angle text or unavailable message
         Text(
-            text = "${currentAngle.roundToInt()}°",
+            text = if (!isAvailable) "N/A" else "${currentAngle.roundToInt()}°",
             color = indicatorColor,
             fontSize = 16.sp,
             fontWeight = FontWeight.Bold,
@@ -351,7 +400,11 @@ fun TiltIndicator(
         
         // Status text
         Text(
-            text = if (isCorrectAngle) "✓ CORRECT" else "↗ TILT TO 45°",
+            text = when {
+                !isAvailable -> "⚠ NO SENSOR"
+                isCorrectAngle -> "✓ CORRECT"
+                else -> "↗ TILT TO 45°"
+            },
             color = indicatorColor,
             fontSize = 10.sp,
             fontWeight = FontWeight.Bold,
@@ -380,10 +433,11 @@ fun ARObjectDetectionScreen() {
     var currentTiltAngle by remember { mutableStateOf(0f) }
     var tiltSensorManager by remember { mutableStateOf<TiltSensorManager?>(null) }
     var lastDetectionTime by remember { mutableStateOf(0L) }
+    var isSensorAvailable by remember { mutableStateOf(true) }
     
-    val targetAngle = -45f
-    val isCorrectAngle = abs(currentTiltAngle - targetAngle) < 5f
-    val detectionZoneColor = if (isCorrectAngle) Color.Green else Color.Red
+    val targetAngle = 45f
+    val isCorrectAngle = isSensorAvailable && abs(currentTiltAngle - targetAngle) < 5f
+    val detectionZoneColor = if (!isSensorAvailable) Color.Gray else if (isCorrectAngle) Color.Green else Color.Red
     
     // Initialize object detector
     LaunchedEffect(Unit) {
@@ -392,9 +446,11 @@ fun ARObjectDetectionScreen() {
     
     // Initialize tilt sensor
     LaunchedEffect(Unit) {
-        tiltSensorManager = TiltSensorManager(context) { angle ->
-            currentTiltAngle = angle
-        }
+        tiltSensorManager = TiltSensorManager(
+            context = context,
+            onTiltChanged = { angle -> currentTiltAngle = angle },
+            onSensorAvailabilityChanged = { available -> isSensorAvailable = available }
+        )
         tiltSensorManager?.startListening()
     }
     
@@ -424,10 +480,10 @@ fun ARObjectDetectionScreen() {
                     // Handle each AR frame
                     currentFrame = arFrame
                     
-                    // Perform object detection only every 3 seconds and when angle is correct
+                    // Perform object detection only every 3 seconds and when angle is correct (or sensor unavailable)
                     val currentTime = System.currentTimeMillis()
                     if (!isDetecting && 
-                        isCorrectAngle && 
+                        (isCorrectAngle || !isSensorAvailable) && 
                         (currentTime - lastDetectionTime) > 3000) {
                         
                         isDetecting = true
@@ -447,6 +503,7 @@ fun ARObjectDetectionScreen() {
             TiltIndicator(
                 currentAngle = currentTiltAngle,
                 targetAngle = targetAngle,
+                isAvailable = isSensorAvailable,
                 modifier = Modifier
                     .align(Alignment.TopEnd)
                     .padding(16.dp)
@@ -464,7 +521,11 @@ fun ARObjectDetectionScreen() {
                     )
             ) {
                 Text(
-                    text = if (isCorrectAngle) "✓ DETECTION ZONE" else "↗ TILT TO 45°",
+                    text = when {
+                        !isSensorAvailable -> "⚠ SENSOR NOT AVAILABLE"
+                        isCorrectAngle -> "✓ DETECTION ZONE"
+                        else -> "↗ TILT TO 45°"
+                    },
                     color = detectionZoneColor,
                     fontSize = 14.sp,
                     fontWeight = FontWeight.Bold,
@@ -576,10 +637,10 @@ fun ARObjectDetectionScreen() {
                 }
             }
             
-            // Camera capture button (only enabled when angle is correct)
+            // Camera capture button (only enabled when angle is correct or sensor unavailable)
             FloatingActionButton(
                 onClick = {
-                    if (isCorrectAngle) {
+                    if (isCorrectAngle || !isSensorAvailable) {
                         coroutineScope.launch {
                             currentFrame?.let { frame ->
                                 capturePhoto(frame, context)
@@ -592,7 +653,7 @@ fun ARObjectDetectionScreen() {
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .padding(32.dp),
-                containerColor = if (isCorrectAngle) MaterialTheme.colorScheme.primary else Color.Gray
+                containerColor = if (isCorrectAngle || !isSensorAvailable) MaterialTheme.colorScheme.primary else Color.Gray
             ) {
                 Icon(
                     imageVector = Icons.Default.Star,
@@ -604,6 +665,7 @@ fun ARObjectDetectionScreen() {
             // Status text
             Text(
                 text = when {
+                    !isSensorAvailable -> "Device has no tilt sensor - detection always active"
                     !isCorrectAngle -> "Tilt device to 45° for detection"
                     detectedObjects.isNotEmpty() -> "${detectedObjects.size} objects detected"
                     isDetecting -> "Scanning..."
