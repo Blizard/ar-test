@@ -50,6 +50,10 @@ dependencies {
     // AR and ML dependencies
     implementation(libs.arsceneview.compose)
     implementation(libs.tensorflow.lite)
+    implementation(libs.tensor.flow.lite.gpu)
+    implementation(libs.tensor.flow.lite.task.vision)
+    implementation(libs.tensor.flow.lite.gpu.delegate.plugin)
+    implementation(libs.litert.metadata)
     implementation(libs.androidx.permissions)
     
     // Camera dependencies
