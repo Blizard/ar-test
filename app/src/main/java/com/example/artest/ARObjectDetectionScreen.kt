@@ -170,11 +170,11 @@ class TensorFlowObjectDetector(private val context: Context) {
     
     companion object {
         private const val MODEL_PATH = "2.tflite"
-        private const val INPUT_SIZE = 320
+        private const val INPUT_SIZE = 640  // Updated to match documentation requirement
         
         // Configurable detection parameters
         const val DETECTION_THRESHOLD = ARDetectionConfig.MIN_CONFIDENCE  // Use config value
-        const val MAX_DETECTIONS = 10         // Maximum number of detections to process
+        const val MAX_DETECTIONS = 25         // Updated to match model output (25 detections)
     }
     
     init {
@@ -203,7 +203,25 @@ class TensorFlowObjectDetector(private val context: Context) {
                 "toothbrush"
             )
             
-            Log.d("TFLite", "Model loaded successfully")
+            // Log model info for debugging
+            interpreter?.let { interp ->
+                Log.d("TFLite", "Model loaded successfully")
+                Log.d("TFLite", "Input tensor count: ${interp.inputTensorCount}")
+                Log.d("TFLite", "Output tensor count: ${interp.outputTensorCount}")
+                
+                // Log input tensor info
+                for (i in 0 until interp.inputTensorCount) {
+                    val inputTensor = interp.getInputTensor(i)
+                    Log.d("TFLite", "Input tensor $i: shape=${inputTensor.shape().contentToString()}, type=${inputTensor.dataType()}")
+                }
+                
+                // Log output tensor info
+                for (i in 0 until interp.outputTensorCount) {
+                    val outputTensor = interp.getOutputTensor(i)
+                    Log.d("TFLite", "Output tensor $i: shape=${outputTensor.shape().contentToString()}, type=${outputTensor.dataType()}")
+                }
+            }
+            
         } catch (e: Exception) {
             Log.e("TFLite", "Error loading model", e)
         }
@@ -224,56 +242,116 @@ class TensorFlowObjectDetector(private val context: Context) {
         try {
             val interpreter = this.interpreter ?: return emptyList()
             
-            // Resize bitmap to model input size
+            // Resize bitmap to model input size (640x640 as per documentation)
             val resizedBitmap = Bitmap.createScaledBitmap(bitmap, INPUT_SIZE, INPUT_SIZE, true)
             
             // Convert bitmap to ByteBuffer
             val inputBuffer = convertBitmapToByteBuffer(resizedBitmap)
             
-            // Prepare output arrays for detection model
-            // Most detection models output: [locations, classes, scores, num_detections]
-            val outputLocations = Array(1) { Array(MAX_DETECTIONS) { FloatArray(4) } } // [batch, max_detections, 4] - bbox coordinates
-            val outputClasses = Array(1) { FloatArray(MAX_DETECTIONS) } // [batch, max_detections] - class indices
-            val outputScores = Array(1) { FloatArray(MAX_DETECTIONS) } // [batch, max_detections] - confidence scores
-            val outputNumDetections = FloatArray(1) // [batch] - number of valid detections
+            // Get input tensor info
+            val inputTensor = interpreter.getInputTensor(0)
+            Log.d("TFLite", "Input tensor shape: ${inputTensor.shape().contentToString()}")
+            Log.d("TFLite", "Input tensor data type: ${inputTensor.dataType()}")
             
-            // Create output map
-            val outputMap = mapOf(
-                0 to outputLocations,
-                1 to outputClasses, 
-                2 to outputScores,
-                3 to outputNumDetections
-            )
+            // Get output tensor shapes from the interpreter
+            val numOutputs = interpreter.outputTensorCount
+            Log.d("TFLite", "Number of output tensors: $numOutputs")
+            
+            for (i in 0 until numOutputs) {
+                val outputTensor = interpreter.getOutputTensor(i)
+                Log.d("TFLite", "Output tensor $i: shape=${outputTensor.shape().contentToString()}, type=${outputTensor.dataType()}")
+            }
+            
+            // Create output arrays based on actual tensor shapes
+            // From the error, we know tensor 0 has shape [1, 25, 4]
+            val outputTensor0 = interpreter.getOutputTensor(0)
+            val tensor0Shape = outputTensor0.shape()
+            val detectionCount = tensor0Shape[1] // Should be 25
+            
+            // Prepare output arrays with correct dimensions
+            val outputLocations = Array(1) { Array(detectionCount) { FloatArray(4) } }
+            
+            // Check if we have more output tensors for classes and scores
+            val outputArrays = mutableMapOf<Int, Any>()
+            outputArrays[0] = outputLocations
+            
+            if (numOutputs > 1) {
+                val outputTensor1 = interpreter.getOutputTensor(1)
+                val tensor1Shape = outputTensor1.shape()
+                val outputClasses = Array(tensor1Shape[0]) { FloatArray(tensor1Shape[1]) }
+                outputArrays[1] = outputClasses
+            }
+            
+            if (numOutputs > 2) {
+                val outputTensor2 = interpreter.getOutputTensor(2)
+                val tensor2Shape = outputTensor2.shape()
+                val outputScores = Array(tensor2Shape[0]) { FloatArray(tensor2Shape[1]) }
+                outputArrays[2] = outputScores
+            }
+            
+            if (numOutputs > 3) {
+                val outputTensor3 = interpreter.getOutputTensor(3)
+                val tensor3Shape = outputTensor3.shape()
+                val outputNumDetections = FloatArray(tensor3Shape[0])
+                outputArrays[3] = outputNumDetections
+            }
             
             // Run inference
-            interpreter.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputMap)
+            interpreter.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputArrays)
             
-            // Process results
-            val numDetections = outputNumDetections[0].toInt().coerceAtMost(MAX_DETECTIONS)
+            // Process results based on available outputs
+            val numDetections = if (outputArrays.containsKey(3)) {
+                (outputArrays[3] as FloatArray)[0].toInt().coerceAtMost(detectionCount)
+            } else {
+                detectionCount // Use all detections if no count tensor
+            }
+            
+            Log.d("TFLite", "Processing $numDetections detections")
             
             for (i in 0 until numDetections) {
-                val score = outputScores[0][i]
+                val score = if (outputArrays.containsKey(2)) {
+                    (outputArrays[2] as Array<FloatArray>)[0][i]
+                } else {
+                    1.0f // Default score if no score tensor
+                }
                 
                 if (score > DETECTION_THRESHOLD) {
-                    val classIndex = outputClasses[0][i].toInt()
+                    val classIndex = if (outputArrays.containsKey(1)) {
+                        (outputArrays[1] as Array<FloatArray>)[0][i].toInt()
+                    } else {
+                        0 // Default class if no class tensor
+                    }
                     
                     // Ensure class index is valid
                     if (classIndex >= 0 && classIndex < labels.size) {
                         val label = labels[classIndex]
                         
-                        // Get bounding box coordinates (normalized 0-1)
-                        val top = outputLocations[0][i][0]
-                        val left = outputLocations[0][i][1] 
-                        val bottom = outputLocations[0][i][2]
-                        val right = outputLocations[0][i][3]
+                        // Get bounding box coordinates from the locations tensor
+                        val locations = outputLocations[0][i]
+                        val top = locations[0]
+                        val left = locations[1]
+                        val bottom = locations[2]
+                        val right = locations[3]
                         
-                        // Convert to actual pixel coordinates
+                        // Convert to actual pixel coordinates (coordinates are usually normalized 0-1)
+                        // Clamp coordinates to valid ranges
+                        val clampedLeft = (left * bitmap.width).coerceIn(0f, bitmap.width.toFloat())
+                        val clampedTop = (top * bitmap.height).coerceIn(0f, bitmap.height.toFloat())
+                        val clampedRight = (right * bitmap.width).coerceIn(0f, bitmap.width.toFloat())
+                        val clampedBottom = (bottom * bitmap.height).coerceIn(0f, bitmap.height.toFloat())
+                        
                         val boundingBox = RectF(
-                            left * bitmap.width,
-                            top * bitmap.height,
-                            right * bitmap.width,
-                            bottom * bitmap.height
+                            clampedLeft,
+                            clampedTop,
+                            clampedRight,
+                            clampedBottom
                         )
+                        
+                        // Validate bounding box dimensions
+                        if (boundingBox.width() <= 0 || boundingBox.height() <= 0) {
+                            Log.w("TFLite", "Invalid bounding box for $label: [$left, $top, $right, $bottom]")
+                            continue
+                        }
                         
                         // Store object without distance calculation for now
                         // Distance will be calculated later using ARCore hitTest
@@ -286,35 +364,72 @@ class TensorFlowObjectDetector(private val context: Context) {
                             )
                         )
                         
-                        Log.d("TFLite", "Detected: $label (${(score * 100).toInt()}%) - distance will be calculated with ARCore")
+                        Log.d("TFLite", "Detected: $label (${(score * 100).toInt()}%) at [${String.format("%.3f", left)}, ${String.format("%.3f", top)}, ${String.format("%.3f", right)}, ${String.format("%.3f", bottom)}]")
+                        Log.d("TFLite", "Pixel coordinates: [${clampedLeft.toInt()}, ${clampedTop.toInt()}, ${clampedRight.toInt()}, ${clampedBottom.toInt()}]")
                     }
                 }
             }
             
         } catch (e: Exception) {
             Log.e("TFLite", "Error during inference", e)
+            // Print stack trace for debugging
+            e.printStackTrace()
         }
         
         return detectedObjects
     }
     
     private fun convertBitmapToByteBuffer(bitmap: Bitmap): ByteBuffer {
-        val byteBuffer = ByteBuffer.allocateDirect(4 * INPUT_SIZE * INPUT_SIZE * 3)
-        byteBuffer.order(ByteOrder.nativeOrder())
+        val interpreter = this.interpreter ?: throw IllegalStateException("Interpreter not initialized")
+        val inputTensor = interpreter.getInputTensor(0)
+        val inputDataType = inputTensor.dataType()
         
-        val intValues = IntArray(INPUT_SIZE * INPUT_SIZE)
-        bitmap.getPixels(intValues, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+        Log.d("TFLite", "Input tensor data type: $inputDataType")
         
-        var pixel = 0
-        for (i in 0 until INPUT_SIZE) {
-            for (j in 0 until INPUT_SIZE) {
-                val pixelValue = intValues[pixel++]
-                byteBuffer.putFloat(((pixelValue shr 16) and 0xFF) / 255.0f)
-                byteBuffer.putFloat(((pixelValue shr 8) and 0xFF) / 255.0f)
-                byteBuffer.putFloat((pixelValue and 0xFF) / 255.0f)
+        // Check if model expects float32 or uint8 input
+        val useFloat32 = inputDataType.toString().contains("FLOAT32")
+        
+        val byteBuffer = if (useFloat32) {
+            // Float32 input (normalized 0-1)
+            val buffer = ByteBuffer.allocateDirect(4 * INPUT_SIZE * INPUT_SIZE * 3)
+            buffer.order(ByteOrder.nativeOrder())
+            
+            val intValues = IntArray(INPUT_SIZE * INPUT_SIZE)
+            bitmap.getPixels(intValues, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+            
+            var pixel = 0
+            for (i in 0 until INPUT_SIZE) {
+                for (j in 0 until INPUT_SIZE) {
+                    val pixelValue = intValues[pixel++]
+                    // Normalize to 0-1 range for float32
+                    buffer.putFloat(((pixelValue shr 16) and 0xFF) / 255.0f) // R
+                    buffer.putFloat(((pixelValue shr 8) and 0xFF) / 255.0f)  // G
+                    buffer.putFloat((pixelValue and 0xFF) / 255.0f)          // B
+                }
             }
+            buffer
+        } else {
+            // Uint8 input (raw values 0-255)
+            val buffer = ByteBuffer.allocateDirect(INPUT_SIZE * INPUT_SIZE * 3)
+            buffer.order(ByteOrder.nativeOrder())
+            
+            val intValues = IntArray(INPUT_SIZE * INPUT_SIZE)
+            bitmap.getPixels(intValues, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+            
+            var pixel = 0
+            for (i in 0 until INPUT_SIZE) {
+                for (j in 0 until INPUT_SIZE) {
+                    val pixelValue = intValues[pixel++]
+                    // Put raw byte values (0-255) for uint8
+                    buffer.put(((pixelValue shr 16) and 0xFF).toByte()) // R
+                    buffer.put(((pixelValue shr 8) and 0xFF).toByte())  // G
+                    buffer.put((pixelValue and 0xFF).toByte())          // B
+                }
+            }
+            buffer
         }
         
+        Log.d("TFLite", "Created input buffer: size=${byteBuffer.capacity()}, type=${if (useFloat32) "float32" else "uint8"}")
         return byteBuffer
     }
     
