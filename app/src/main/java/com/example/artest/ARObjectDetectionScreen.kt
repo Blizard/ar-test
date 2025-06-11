@@ -15,12 +15,10 @@ import android.media.Image
 import android.os.Environment
 import android.util.Log
 import android.widget.Toast
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Star
@@ -28,37 +26,23 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.rotate
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.drawscope.DrawScope
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.PermissionStatus
-import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberPermissionState
 import com.google.ar.core.*
 import io.github.sceneview.ar.ARScene
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.tensorflow.lite.Interpreter
 import java.io.ByteArrayOutputStream
 import java.io.File
-import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.nio.channels.FileChannel
 import java.text.SimpleDateFormat
 import java.util.*
 import kotlin.math.*
@@ -72,22 +56,23 @@ data class DetectedObject(
 
 // Configuration constants
 object ARDetectionConfig {
+
     // Tilt angle configuration
     const val TARGET_ANGLE = -45f           // Target tilt angle in degrees
-    const val ANGLE_TOLERANCE = 10f         // Acceptable deviation from target angle
-    
+    const val ANGLE_TOLERANCE = 20f         // Acceptable deviation from target angle
+
     // Detection configuration
     const val MIN_CONFIDENCE = 0.5f         // Minimum confidence threshold (60%)
     const val DETECTION_INTERVAL_MS = 3000L // Detection interval in milliseconds
-    
+
     // Detection zone configuration
     const val DETECTION_ZONE_WIDTH_RATIO = 0.4f   // Detection zone width as ratio of screen width
     const val DETECTION_ZONE_HEIGHT_RATIO = 0.3f  // Detection zone height as ratio of screen height
-    
+
     // Distance calculation
     const val CAMERA_FOCAL_LENGTH_PX = 800f // Approximate focal length in pixels
     const val DEFAULT_OBJECT_WIDTH_M = 0.3f // Default object width for unknown objects (30cm)
-    
+
     // ARCore hit test configuration
     const val HIT_TEST_MAX_DISTANCE = 10f   // Maximum distance for hit test (10 meters)
     const val USE_ARCORE_DISTANCE = true    // Enable/disable ARCore distance measurement
@@ -98,375 +83,167 @@ class TiltSensorManager(
     private val onTiltChanged: (Float) -> Unit,
     private val onSensorAvailabilityChanged: (Boolean) -> Unit
 ) : SensorEventListener {
-    
+
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     private val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
     private val magnetometer = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
-    
+
     private val accelerometerReading = FloatArray(3)
     private val magnetometerReading = FloatArray(3)
     private val rotationMatrix = FloatArray(9)
     private val orientationAngles = FloatArray(3)
-    
+
     val isSensorAvailable: Boolean
         get() = accelerometer != null && magnetometer != null
-    
+
     fun startListening() {
         if (!isSensorAvailable) {
             Log.w("TiltSensor", "Accelerometer or magnetometer not available")
             onSensorAvailabilityChanged(false)
             return
         }
-        
+
         val accelerometerRegistered = sensorManager.registerListener(
             this, accelerometer, SensorManager.SENSOR_DELAY_UI
         )
         val magnetometerRegistered = sensorManager.registerListener(
             this, magnetometer, SensorManager.SENSOR_DELAY_UI
         )
-        
+
         val sensorsRegistered = accelerometerRegistered && magnetometerRegistered
         onSensorAvailabilityChanged(sensorsRegistered)
-        
+
         if (!sensorsRegistered) {
             Log.w("TiltSensor", "Failed to register sensor listeners")
         }
     }
-    
+
     fun stopListening() {
         sensorManager.unregisterListener(this)
     }
-    
+
     override fun onSensorChanged(event: SensorEvent?) {
         event?.let {
             when (it.sensor?.type) {
                 Sensor.TYPE_ACCELEROMETER -> {
                     System.arraycopy(it.values, 0, accelerometerReading, 0, accelerometerReading.size)
                 }
+
                 Sensor.TYPE_MAGNETIC_FIELD -> {
                     System.arraycopy(it.values, 0, magnetometerReading, 0, magnetometerReading.size)
                 }
             }
-            
+
             // Calculate orientation
             SensorManager.getRotationMatrix(
                 rotationMatrix, null,
                 accelerometerReading, magnetometerReading
             )
             SensorManager.getOrientation(rotationMatrix, orientationAngles)
-            
+
             // Convert pitch to degrees (orientationAngles[1] is pitch in radians)
             val pitchDegrees = Math.toDegrees(orientationAngles[1].toDouble()).toFloat()
             onTiltChanged(pitchDegrees)
         }
     }
-    
+
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 }
 
-class TensorFlowObjectDetector(private val context: Context) {
-    private var interpreter: Interpreter? = null
-    private var labels: List<String> = emptyList()
-    
+/**
+ * TensorFlow Lite Object Detector using the Task API
+ * This implementation automatically extracts labels from the model metadata
+ */
+class TfLiteObjectDetector(
+    private val context: Context,
+    modelFileName: String = "2.tflite", // Change this to your model file name
+    private val threshold: Float = 0.5f,
+    private val maxResults: Int = 10,
+    private val numThreads: Int = 4
+) {
+
+    private var objectDetector: org.tensorflow.lite.task.vision.detector.ObjectDetector? = null
+
     companion object {
-        private const val MODEL_PATH = "2.tflite"
-        private const val INPUT_SIZE = 640  // Updated to match documentation requirement
-        
-        // Configurable detection parameters
-        const val DETECTION_THRESHOLD = ARDetectionConfig.MIN_CONFIDENCE  // Use config value
-        const val MAX_DETECTIONS = 25         // Updated to match model output (25 detections)
+
+        private const val TAG = "TfLiteObjectDetector"
     }
-    
+
     init {
-        initializeModel()
+        setupDetector(modelFileName)
     }
-    
-    private fun initializeModel() {
+
+    private fun setupDetector(modelFileName: String) {
         try {
-            // Load the TFLite model
-            val modelBuffer = loadModelFile()
-            interpreter = Interpreter(modelBuffer)
-            
-            // Load labels (COCO dataset labels)
-            labels = listOf(
-                "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
-                "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench",
-                "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra",
-                "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
-                "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove",
-                "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup",
-                "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
-                "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
-                "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
-                "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
-                "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
-                "toothbrush"
+            // Configure the object detector options
+            val baseOptions = org.tensorflow.lite.task.core.BaseOptions.builder()
+                .setNumThreads(numThreads)
+                .build()
+
+            val options = org.tensorflow.lite.task.vision.detector.ObjectDetector.ObjectDetectorOptions.builder()
+                .setBaseOptions(baseOptions)
+                .setMaxResults(maxResults)
+                .setScoreThreshold(threshold)
+                .build()
+
+            // Create the object detector from model file
+            objectDetector = org.tensorflow.lite.task.vision.detector.ObjectDetector.createFromFileAndOptions(
+                context,
+                modelFileName,
+                options
             )
-            
-            // Log model info for debugging
-            interpreter?.let { interp ->
-                Log.d("TFLite", "Model loaded successfully")
-                Log.d("TFLite", "Input tensor count: ${interp.inputTensorCount}")
-                Log.d("TFLite", "Output tensor count: ${interp.outputTensorCount}")
-                
-                // Log input tensor info
-                for (i in 0 until interp.inputTensorCount) {
-                    val inputTensor = interp.getInputTensor(i)
-                    Log.d("TFLite", "Input tensor $i: shape=${inputTensor.shape().contentToString()}, type=${inputTensor.dataType()}")
-                }
-                
-                // Log output tensor info
-                for (i in 0 until interp.outputTensorCount) {
-                    val outputTensor = interp.getOutputTensor(i)
-                    Log.d("TFLite", "Output tensor $i: shape=${outputTensor.shape().contentToString()}, type=${outputTensor.dataType()}")
-                }
-            }
-            
+
+            Log.d(TAG, "Object detector initialized successfully with model: $modelFileName")
         } catch (e: Exception) {
-            Log.e("TFLite", "Error loading model", e)
+            Log.e(TAG, "Error initializing object detector", e)
         }
     }
-    
-    private fun loadModelFile(): ByteBuffer {
-        val assetFileDescriptor = context.assets.openFd(MODEL_PATH)
-        val inputStream = FileInputStream(assetFileDescriptor.fileDescriptor)
-        val fileChannel = inputStream.channel
-        val startOffset = assetFileDescriptor.startOffset
-        val declaredLength = assetFileDescriptor.declaredLength
-        return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
-    }
-    
+
+    /**
+     * Detect objects in the given bitmap
+     * Returns a list of DetectedObject with labels extracted from the model
+     */
     fun detectObjects(bitmap: Bitmap): List<DetectedObject> {
-        val detectedObjects = mutableListOf<DetectedObject>()
-        
-        try {
-            val interpreter = this.interpreter ?: return emptyList()
-            
-            // Resize bitmap to model input size (640x640 as per documentation)
-            val resizedBitmap = Bitmap.createScaledBitmap(bitmap, INPUT_SIZE, INPUT_SIZE, true)
-            
-            // Convert bitmap to ByteBuffer
-            val inputBuffer = convertBitmapToByteBuffer(resizedBitmap)
-            
-            // Get input tensor info
-            val inputTensor = interpreter.getInputTensor(0)
-            Log.d("TFLite", "Input tensor shape: ${inputTensor.shape().contentToString()}")
-            Log.d("TFLite", "Input tensor data type: ${inputTensor.dataType()}")
-            
-            // Get output tensor shapes from the interpreter
-            val numOutputs = interpreter.outputTensorCount
-            Log.d("TFLite", "Number of output tensors: $numOutputs")
-            
-            for (i in 0 until numOutputs) {
-                val outputTensor = interpreter.getOutputTensor(i)
-                Log.d("TFLite", "Output tensor $i: shape=${outputTensor.shape().contentToString()}, type=${outputTensor.dataType()}")
-            }
-            
-            // Create output arrays based on actual tensor shapes
-            // From the error, we know tensor 0 has shape [1, 25, 4]
-            val outputTensor0 = interpreter.getOutputTensor(0)
-            val tensor0Shape = outputTensor0.shape()
-            val detectionCount = tensor0Shape[1] // Should be 25
-            
-            // Prepare output arrays with correct dimensions
-            val outputLocations = Array(1) { Array(detectionCount) { FloatArray(4) } }
-            
-            // Check if we have more output tensors for classes and scores
-            val outputArrays = mutableMapOf<Int, Any>()
-            outputArrays[0] = outputLocations
-            
-            if (numOutputs > 1) {
-                val outputTensor1 = interpreter.getOutputTensor(1)
-                val tensor1Shape = outputTensor1.shape()
-                val outputClasses = Array(tensor1Shape[0]) { FloatArray(tensor1Shape[1]) }
-                outputArrays[1] = outputClasses
-            }
-            
-            if (numOutputs > 2) {
-                val outputTensor2 = interpreter.getOutputTensor(2)
-                val tensor2Shape = outputTensor2.shape()
-                val outputScores = Array(tensor2Shape[0]) { FloatArray(tensor2Shape[1]) }
-                outputArrays[2] = outputScores
-            }
-            
-            if (numOutputs > 3) {
-                val outputTensor3 = interpreter.getOutputTensor(3)
-                val tensor3Shape = outputTensor3.shape()
-                val outputNumDetections = FloatArray(tensor3Shape[0])
-                outputArrays[3] = outputNumDetections
-            }
-            
-            // Run inference
-            interpreter.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputArrays)
-            
-            // Process results based on available outputs
-            val numDetections = if (outputArrays.containsKey(3)) {
-                (outputArrays[3] as FloatArray)[0].toInt().coerceAtMost(detectionCount)
-            } else {
-                detectionCount // Use all detections if no count tensor
-            }
-            
-            Log.d("TFLite", "Processing $numDetections detections")
-            
-            for (i in 0 until numDetections) {
-                val score = if (outputArrays.containsKey(2)) {
-                    (outputArrays[2] as Array<FloatArray>)[0][i]
-                } else {
-                    1.0f // Default score if no score tensor
-                }
-                
-                if (score > DETECTION_THRESHOLD) {
-                    val classIndex = if (outputArrays.containsKey(1)) {
-                        (outputArrays[1] as Array<FloatArray>)[0][i].toInt()
-                    } else {
-                        0 // Default class if no class tensor
-                    }
-                    
-                    // Ensure class index is valid
-                    if (classIndex >= 0 && classIndex < labels.size) {
-                        val label = labels[classIndex]
-                        
-                        // Get bounding box coordinates from the locations tensor
-                        val locations = outputLocations[0][i]
-                        val top = locations[0]
-                        val left = locations[1]
-                        val bottom = locations[2]
-                        val right = locations[3]
-                        
-                        // Convert to actual pixel coordinates (coordinates are usually normalized 0-1)
-                        // Clamp coordinates to valid ranges
-                        val clampedLeft = (left * bitmap.width).coerceIn(0f, bitmap.width.toFloat())
-                        val clampedTop = (top * bitmap.height).coerceIn(0f, bitmap.height.toFloat())
-                        val clampedRight = (right * bitmap.width).coerceIn(0f, bitmap.width.toFloat())
-                        val clampedBottom = (bottom * bitmap.height).coerceIn(0f, bitmap.height.toFloat())
-                        
-                        val boundingBox = RectF(
-                            clampedLeft,
-                            clampedTop,
-                            clampedRight,
-                            clampedBottom
-                        )
-                        
-                        // Validate bounding box dimensions
-                        if (boundingBox.width() <= 0 || boundingBox.height() <= 0) {
-                            Log.w("TFLite", "Invalid bounding box for $label: [$left, $top, $right, $bottom]")
-                            continue
-                        }
-                        
-                        // Store object without distance calculation for now
-                        // Distance will be calculated later using ARCore hitTest
-                        detectedObjects.add(
-                            DetectedObject(
-                                label = label,
-                                confidence = score,
-                                boundingBox = boundingBox,
-                                distance = 0f // Will be updated with ARCore measurement
-                            )
-                        )
-                        
-                        Log.d("TFLite", "Detected: $label (${(score * 100).toInt()}%) at [${String.format("%.3f", left)}, ${String.format("%.3f", top)}, ${String.format("%.3f", right)}, ${String.format("%.3f", bottom)}]")
-                        Log.d("TFLite", "Pixel coordinates: [${clampedLeft.toInt()}, ${clampedTop.toInt()}, ${clampedRight.toInt()}, ${clampedBottom.toInt()}]")
-                    }
+        val detector = objectDetector ?: run {
+            Log.e(TAG, "Object detector not initialized")
+            return emptyList()
+        }
+
+        return try {
+            // Create TensorImage from bitmap
+            val tensorImage = org.tensorflow.lite.support.image.TensorImage.fromBitmap(bitmap)
+
+            // Run object detection
+            val results = detector.detect(tensorImage)
+
+            // Convert Detection objects to our DetectedObject format
+            results.map { detection ->
+                val category = detection.categories.firstOrNull()
+                DetectedObject(
+                    label = category?.label ?: "Unknown",
+                    confidence = category?.score ?: 0f,
+                    boundingBox = detection.boundingBox,
+                    distance = 0f // Will be calculated with ARCore
+                )
+            }.also { detectedObjects ->
+                Log.d(TAG, "Detected ${detectedObjects.size} objects")
+                detectedObjects.forEach { obj ->
+                    Log.d(
+                        TAG, "- ${obj.label}: ${(obj.confidence * 100).toInt()}% at " +
+                            "[${obj.boundingBox.left}, ${obj.boundingBox.top}, " +
+                            "${obj.boundingBox.right}, ${obj.boundingBox.bottom}]"
+                    )
                 }
             }
-            
         } catch (e: Exception) {
-            Log.e("TFLite", "Error during inference", e)
-            // Print stack trace for debugging
-            e.printStackTrace()
-        }
-        
-        return detectedObjects
-    }
-    
-    private fun convertBitmapToByteBuffer(bitmap: Bitmap): ByteBuffer {
-        val interpreter = this.interpreter ?: throw IllegalStateException("Interpreter not initialized")
-        val inputTensor = interpreter.getInputTensor(0)
-        val inputDataType = inputTensor.dataType()
-        
-        Log.d("TFLite", "Input tensor data type: $inputDataType")
-        
-        // Check if model expects float32 or uint8 input
-        val useFloat32 = inputDataType.toString().contains("FLOAT32")
-        
-        val byteBuffer = if (useFloat32) {
-            // Float32 input (normalized 0-1)
-            val buffer = ByteBuffer.allocateDirect(4 * INPUT_SIZE * INPUT_SIZE * 3)
-            buffer.order(ByteOrder.nativeOrder())
-            
-            val intValues = IntArray(INPUT_SIZE * INPUT_SIZE)
-            bitmap.getPixels(intValues, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
-            
-            var pixel = 0
-            for (i in 0 until INPUT_SIZE) {
-                for (j in 0 until INPUT_SIZE) {
-                    val pixelValue = intValues[pixel++]
-                    // Normalize to 0-1 range for float32
-                    buffer.putFloat(((pixelValue shr 16) and 0xFF) / 255.0f) // R
-                    buffer.putFloat(((pixelValue shr 8) and 0xFF) / 255.0f)  // G
-                    buffer.putFloat((pixelValue and 0xFF) / 255.0f)          // B
-                }
-            }
-            buffer
-        } else {
-            // Uint8 input (raw values 0-255)
-            val buffer = ByteBuffer.allocateDirect(INPUT_SIZE * INPUT_SIZE * 3)
-            buffer.order(ByteOrder.nativeOrder())
-            
-            val intValues = IntArray(INPUT_SIZE * INPUT_SIZE)
-            bitmap.getPixels(intValues, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
-            
-            var pixel = 0
-            for (i in 0 until INPUT_SIZE) {
-                for (j in 0 until INPUT_SIZE) {
-                    val pixelValue = intValues[pixel++]
-                    // Put raw byte values (0-255) for uint8
-                    buffer.put(((pixelValue shr 16) and 0xFF).toByte()) // R
-                    buffer.put(((pixelValue shr 8) and 0xFF).toByte())  // G
-                    buffer.put((pixelValue and 0xFF).toByte())          // B
-                }
-            }
-            buffer
-        }
-        
-        Log.d("TFLite", "Created input buffer: size=${byteBuffer.capacity()}, type=${if (useFloat32) "float32" else "uint8"}")
-        return byteBuffer
-    }
-    
-    private fun calculateDistance(objectWidthPixels: Float, objectType: String): Float {
-        // This is a fallback estimation method
-        // Real distance should be calculated using ARCore hitTest/raycast
-        // This method is kept for objects where ARCore measurement fails
-        val realWorldWidths = mapOf(
-            "person" to 0.5f,          // Average shoulder width
-            "car" to 1.8f,             // Average car width
-            "bicycle" to 0.6f,         // Average bicycle width
-            "motorcycle" to 0.8f,      // Average motorcycle width
-            "bus" to 2.5f,             // Average bus width
-            "truck" to 2.4f,           // Average truck width
-            "bottle" to 0.07f,         // Average bottle diameter
-            "wine glass" to 0.08f,     // Average wine glass diameter
-            "cup" to 0.09f,            // Average cup diameter
-            "chair" to 0.5f,           // Average chair width
-            "couch" to 1.8f,           // Average couch width
-            "dining table" to 1.2f,    // Average table width
-            "tv" to 1.0f,              // Average TV width
-            "laptop" to 0.35f,         // Average laptop width
-            "cell phone" to 0.08f,     // Average phone width
-            "book" to 0.15f,           // Average book width
-        )
-        
-        val assumedRealWidth = realWorldWidths[objectType] ?: ARDetectionConfig.DEFAULT_OBJECT_WIDTH_M
-        val focalLength = ARDetectionConfig.CAMERA_FOCAL_LENGTH_PX
-        
-        return if (objectWidthPixels > 0) {
-            (assumedRealWidth * focalLength) / objectWidthPixels
-        } else {
-            0f
+            Log.e(TAG, "Error during object detection", e)
+            emptyList()
         }
     }
-    
-    // Update detected objects with ARCore distance measurements
+
+    /**
+     * Update detected objects with ARCore distance measurements
+     */
     fun updateObjectsWithARCoreDistances(
         frame: Frame,
         detectedObjects: List<DetectedObject>,
@@ -474,38 +251,29 @@ class TensorFlowObjectDetector(private val context: Context) {
         imageHeight: Int
     ): List<DetectedObject> {
         return detectedObjects.map { obj ->
-            // Calculate center point of the object's bounding box
+            // Calculate center point of the bounding box
             val centerX = (obj.boundingBox.left + obj.boundingBox.right) / 2f
             val centerY = (obj.boundingBox.top + obj.boundingBox.bottom) / 2f
-            
-            // Normalize coordinates to screen space (0-1)
-            val normalizedX = centerX / imageWidth
-            val normalizedY = centerY / imageHeight
-            
-            // Convert to screen coordinates (assuming full screen AR view)
-            // This would need to be adjusted based on actual view dimensions
-            val screenX = normalizedX * imageWidth
-            val screenY = normalizedY * imageHeight
-            
+
             // Calculate ARCore distance
-            val arcoreDistance = calculateARCoreDistance(frame, screenX, screenY)
-            
-            // Use ARCore distance if available, otherwise fallback to estimation
+            val arcoreDistance = calculateARCoreDistance(frame, centerX, centerY)
+
+            // Use ARCore distance if available, otherwise use fallback estimation
             val finalDistance = if (arcoreDistance > 0) {
                 arcoreDistance
             } else {
                 // Fallback to size-based estimation
-                val objectWidth = obj.boundingBox.width()
-                calculateDistance(objectWidth, obj.label)
+                estimateDistanceFromSize(obj.boundingBox, obj.label)
             }
-            
-            // Return updated object with real distance
+
             obj.copy(distance = finalDistance)
         }
     }
-    
-    // Calculate real distance using ARCore hitTest
-    fun calculateARCoreDistance(
+
+    /**
+     * Calculate real distance using ARCore hit test
+     */
+    private fun calculateARCoreDistance(
         frame: Frame,
         screenX: Float,
         screenY: Float
@@ -515,46 +283,107 @@ class TensorFlowObjectDetector(private val context: Context) {
             if (!ARDetectionConfig.USE_ARCORE_DISTANCE) {
                 return -1f
             }
-            
+
             // Perform hit test at the object's center point
             val hits = frame.hitTest(screenX, screenY)
-            
+
             if (hits.isNotEmpty()) {
-                // Get the closest hit result
                 val hit = hits[0]
-                val hitPose = hit.hitPose
-                
-                // Get camera pose
-                val cameraPose = frame.camera.pose
-                
+//                val hitPose = hit.hitPose
+//                val cameraPose = frame.camera.pose
+
                 // Calculate distance between camera and hit point
-                val dx = hitPose.tx() - cameraPose.tx()
-                val dy = hitPose.ty() - cameraPose.ty() 
-                val dz = hitPose.tz() - cameraPose.tz()
-                
-                val distance = sqrt(dx * dx + dy * dy + dz * dz)
-                
-                // Validate distance is within reasonable range
-                if (distance > 0 && distance <= ARDetectionConfig.HIT_TEST_MAX_DISTANCE) {
-                    Log.d("ARCore Distance", "Hit test successful: ${String.format("%.2f", distance)}m at (${screenX}, ${screenY})")
-                    distance
+//                val dx = hitPose.tx() - cameraPose.tx()
+//                val dy = hitPose.ty() - cameraPose.ty()
+//                val dz = hitPose.tz() - cameraPose.tz()
+
+//                val distance = sqrt(dx * dx + dy * dy + dz * dz)
+
+                // Validate distance
+                if (hit.distance > 0 && hit.distance <= 10f) {
+                    Log.d(TAG, "ARCore distance: ${String.format("%.2f", hit.distance)}m")
+                    hit.distance
                 } else {
-                    Log.w("ARCore Distance", "Distance out of range: ${String.format("%.2f", distance)}m")
                     -1f
                 }
             } else {
-                Log.d("ARCore Distance", "No hit detected at (${screenX}, ${screenY})")
-                // No hit detected, return -1 to indicate failure
                 -1f
             }
         } catch (e: Exception) {
-            Log.e("ARCore Distance", "Error calculating ARCore distance", e)
+            Log.e(TAG, "Error calculating ARCore distance", e)
             -1f
         }
     }
-    
+
+    /**
+     * Fallback distance estimation based on object size
+     */
+    private fun estimateDistanceFromSize(
+        boundingBox: RectF,
+        objectType: String
+    ): Float {
+        // Known object sizes in meters (width)
+        val knownSizes = mapOf(
+            "person" to 0.5f,
+            "car" to 1.8f,
+            "bicycle" to 0.6f,
+            "motorcycle" to 0.8f,
+            "bus" to 2.5f,
+            "truck" to 2.4f,
+            "bottle" to 0.07f,
+            "cup" to 0.09f,
+            "chair" to 0.5f,
+            "laptop" to 0.35f,
+            "cell phone" to 0.08f,
+            "book" to 0.15f,
+            "tv" to 1.0f,
+            "monitor" to 0.5f,
+            "keyboard" to 0.35f,
+            "mouse" to 0.08f,
+            "backpack" to 0.4f,
+            "handbag" to 0.3f,
+            "suitcase" to 0.6f,
+            "dog" to 0.5f,
+            "cat" to 0.3f,
+            "bird" to 0.2f
+        )
+
+        val objectWidth = boundingBox.width()
+        val assumedRealWidth = knownSizes[objectType.lowercase()] ?: 0.3f
+        val focalLength = 800f // Approximate focal length in pixels
+
+        return if (objectWidth > 0) {
+            (assumedRealWidth * focalLength) / objectWidth
+        } else {
+            0f
+        }
+    }
+
+    /**
+     * Get available labels from the model
+     * This is useful for debugging and understanding what the model can detect
+     */
+    fun getAvailableLabels(): List<String> {
+        // The Task API automatically handles label extraction from model metadata
+        // This method is for informational purposes
+        return try {
+            // Unfortunately, the Task API doesn't expose a direct way to get all labels
+            // But they are automatically used when detection results are returned
+            Log.d(TAG, "Labels are automatically extracted from model metadata")
+            emptyList()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting labels", e)
+            emptyList()
+        }
+    }
+
+    /**
+     * Clean up resources
+     */
     fun close() {
-        interpreter?.close()
+        objectDetector?.close()
+        objectDetector = null
+        Log.d(TAG, "Object detector closed")
     }
 }
 
@@ -567,98 +396,11 @@ fun TiltIndicator(
 ) {
     val isCorrectAngle = abs(currentAngle - targetAngle) < ARDetectionConfig.ANGLE_TOLERANCE
     val indicatorColor = if (!isAvailable) Color.Gray else if (isCorrectAngle) Color.Green else Color.Red
-    
+
     Column(
         modifier = modifier,
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // Visual tilt indicator
-        Box(
-            modifier = Modifier
-                .size(80.dp)
-                .background(
-                    Color.Black.copy(alpha = 0.7f),
-                    CircleShape
-                )
-                .padding(8.dp),
-            contentAlignment = Alignment.Center
-        ) {
-            if (!isAvailable) {
-                // Show "X" when sensors not available
-                Canvas(modifier = Modifier.fillMaxSize()) {
-                    val center = Offset(size.width / 2, size.height / 2)
-                    val radius = size.minDimension / 2 - 8.dp.toPx()
-                    
-                    // Draw circle background
-                    drawCircle(
-                        color = Color.Gray.copy(alpha = 0.3f),
-                        radius = radius,
-                        center = center,
-                        style = Stroke(width = 4.dp.toPx())
-                    )
-                    
-                    // Draw X
-                    val lineLength = radius * 0.6f
-                    drawLine(
-                        color = Color.Red,
-                        start = Offset(center.x - lineLength, center.y - lineLength),
-                        end = Offset(center.x + lineLength, center.y + lineLength),
-                        strokeWidth = 4.dp.toPx()
-                    )
-                    drawLine(
-                        color = Color.Red,
-                        start = Offset(center.x + lineLength, center.y - lineLength),
-                        end = Offset(center.x - lineLength, center.y + lineLength),
-                        strokeWidth = 4.dp.toPx()
-                    )
-                }
-            } else {
-                Canvas(modifier = Modifier.fillMaxSize()) {
-                    val center = Offset(size.width / 2, size.height / 2)
-                    val radius = size.minDimension / 2 - 8.dp.toPx()
-                    
-                    // Draw circle background
-                    drawCircle(
-                        color = Color.Gray.copy(alpha = 0.3f),
-                        radius = radius,
-                        center = center,
-                        style = Stroke(width = 4.dp.toPx())
-                    )
-                    
-                    // Draw target angle indicator (45°)
-                    val targetAngleRad = Math.toRadians((targetAngle - 90).toDouble())
-                    val targetX = center.x + radius * cos(targetAngleRad).toFloat()
-                    val targetY = center.y + radius * sin(targetAngleRad).toFloat()
-                    
-                    drawCircle(
-                        color = Color.Green,
-                        radius = 6.dp.toPx(),
-                        center = Offset(targetX, targetY)
-                    )
-                    
-                    // Draw current angle indicator
-                    val currentAngleRad = Math.toRadians((currentAngle - 90).toDouble())
-                    val currentX = center.x + radius * cos(currentAngleRad).toFloat()
-                    val currentY = center.y + radius * sin(currentAngleRad).toFloat()
-                    
-                    drawCircle(
-                        color = indicatorColor,
-                        radius = 8.dp.toPx(),
-                        center = Offset(currentX, currentY)
-                    )
-                    
-                    // Draw center dot
-                    drawCircle(
-                        color = Color.White,
-                        radius = 3.dp.toPx(),
-                        center = center
-                    )
-                }
-            }
-        }
-        
-        Spacer(modifier = Modifier.height(8.dp))
-        
         // Angle text or unavailable message
         Text(
             text = if (!isAvailable) "N/A" else "${currentAngle.roundToInt()}°",
@@ -672,7 +414,7 @@ fun TiltIndicator(
                 )
                 .padding(horizontal = 12.dp, vertical = 4.dp)
         )
-        
+
         // Status text
         Text(
             text = when {
@@ -699,26 +441,32 @@ fun ARObjectDetectionScreen() {
     val context = LocalContext.current
     val cameraPermissionState = rememberPermissionState(android.Manifest.permission.CAMERA)
     val coroutineScope = rememberCoroutineScope()
-    
+
     var detectedObjects by remember { mutableStateOf<List<DetectedObject>>(emptyList()) }
     var isDetecting by remember { mutableStateOf(false) }
-    var objectDetector by remember { mutableStateOf<TensorFlowObjectDetector?>(null) }
+    var objectDetector by remember { mutableStateOf<TfLiteObjectDetector?>(null) }
     var arSession by remember { mutableStateOf<Session?>(null) }
     var currentFrame by remember { mutableStateOf<Frame?>(null) }
     var currentTiltAngle by remember { mutableStateOf(0f) }
     var tiltSensorManager by remember { mutableStateOf<TiltSensorManager?>(null) }
     var lastDetectionTime by remember { mutableStateOf(0L) }
     var isSensorAvailable by remember { mutableStateOf(true) }
-    
+
     val targetAngle = ARDetectionConfig.TARGET_ANGLE
     val isCorrectAngle = isSensorAvailable && abs(currentTiltAngle - targetAngle) < ARDetectionConfig.ANGLE_TOLERANCE
     val detectionZoneColor = if (!isSensorAvailable) Color.Gray else if (isCorrectAngle) Color.Green else Color.Red
-    
-    // Initialize object detector
+
+    // Initialize object detector with the EfficientDet model
     LaunchedEffect(Unit) {
-        objectDetector = TensorFlowObjectDetector(context)
+        objectDetector = TfLiteObjectDetector(
+            context = context,
+            modelFileName = "2-metadata.tflite", // Make sure to place this file in assets folder
+            threshold = ARDetectionConfig.MIN_CONFIDENCE,
+            maxResults = 25,
+            numThreads = 4
+        )
     }
-    
+
     // Initialize tilt sensor
     LaunchedEffect(Unit) {
         tiltSensorManager = TiltSensorManager(
@@ -728,7 +476,7 @@ fun ARObjectDetectionScreen() {
         )
         tiltSensorManager?.startListening()
     }
-    
+
     // Clean up
     DisposableEffect(Unit) {
         onDispose {
@@ -736,7 +484,7 @@ fun ARObjectDetectionScreen() {
             tiltSensorManager?.stopListening()
         }
     }
-    
+
     if (cameraPermissionState.status == PermissionStatus.Granted) {
         Box(modifier = Modifier.fillMaxSize()) {
             // AR Scene (Compose-native, no AndroidView needed)
@@ -757,13 +505,14 @@ fun ARObjectDetectionScreen() {
 
                     // Perform object detection only every 3 seconds and when angle is correct (or sensor unavailable)
                     val currentTime = System.currentTimeMillis()
-                    if (!isDetecting && 
-                        (isCorrectAngle || !isSensorAvailable) && 
-                        (currentTime - lastDetectionTime) > ARDetectionConfig.DETECTION_INTERVAL_MS) {
-                        
+                    if (!isDetecting &&
+                        (isCorrectAngle || !isSensorAvailable) &&
+                        (currentTime - lastDetectionTime) > ARDetectionConfig.DETECTION_INTERVAL_MS
+                    ) {
+
                         isDetecting = true
                         lastDetectionTime = currentTime
-                        
+
                         coroutineScope.launch {
                             performObjectDetection(arFrame, objectDetector) { objects ->
                                 detectedObjects = objects
@@ -773,7 +522,7 @@ fun ARObjectDetectionScreen() {
                     }
                 }
             )
-            
+
             // Tilt indicator (top right)
             TiltIndicator(
                 currentAngle = currentTiltAngle,
@@ -781,9 +530,9 @@ fun ARObjectDetectionScreen() {
                 isAvailable = isSensorAvailable,
                 modifier = Modifier
                     .align(Alignment.TopEnd)
-                    .padding(16.dp)
+                    .padding(top = 64.dp)
             )
-            
+
             // Detection rectangle overlay with dynamic color
             Box(
                 modifier = Modifier
@@ -813,13 +562,13 @@ fun ARObjectDetectionScreen() {
                         .padding(horizontal = 8.dp, vertical = 4.dp)
                 )
             }
-            
+
             // Detected objects info panel (only show for longer duration)
             if (detectedObjects.isNotEmpty()) {
                 LazyColumn(
                     modifier = Modifier
                         .align(Alignment.TopStart)
-                        .padding(16.dp)
+                        .padding(top = 64.dp, start = 16.dp)
                         .background(
                             Color.Black.copy(alpha = 0.8f),
                             RoundedCornerShape(12.dp)
@@ -854,7 +603,7 @@ fun ARObjectDetectionScreen() {
                             }
                         }
                     }
-                    
+
                     items(detectedObjects.size) { index ->
                         val obj = detectedObjects[index]
                         Card(
@@ -911,7 +660,7 @@ fun ARObjectDetectionScreen() {
                     }
                 }
             }
-            
+
             // Camera capture button (only enabled when angle is correct or sensor unavailable)
             FloatingActionButton(
                 onClick = {
@@ -936,7 +685,7 @@ fun ARObjectDetectionScreen() {
                     tint = Color.White
                 )
             }
-            
+
             // Status text
             Text(
                 text = when {
@@ -1002,7 +751,7 @@ fun ARObjectDetectionScreen() {
 
 private suspend fun performObjectDetection(
     frame: Frame,
-    detector: TensorFlowObjectDetector?,
+    detector: TfLiteObjectDetector?,
     onObjectsDetected: (List<DetectedObject>) -> Unit
 ) {
     withContext(Dispatchers.IO) {
@@ -1010,44 +759,44 @@ private suspend fun performObjectDetection(
             val image = frame.acquireCameraImage()
             image?.let { cameraImage ->
                 val bitmap = imageProxyToBitmap(cameraImage)
-                
+
                 // Get initial detections (without distance)
                 val initialDetections = detector?.detectObjects(bitmap) ?: emptyList()
-                
+
                 // Update detections with ARCore distance measurements
                 val detectionsWithDistance = detector?.updateObjectsWithARCoreDistances(
                     frame, initialDetections, bitmap.width, bitmap.height
                 ) ?: emptyList()
-                
+
                 // Filter objects that are in the detection area (center of screen)
                 val centerX = bitmap.width / 2f
                 val centerY = bitmap.height / 2f
                 val detectionWidth = bitmap.width * ARDetectionConfig.DETECTION_ZONE_WIDTH_RATIO
                 val detectionHeight = bitmap.height * ARDetectionConfig.DETECTION_ZONE_HEIGHT_RATIO
-                
+
                 val detectionRect = RectF(
                     centerX - detectionWidth / 2,
                     centerY - detectionHeight / 2,
                     centerX + detectionWidth / 2,
                     centerY + detectionHeight / 2
                 )
-                
+
                 // Only include objects that intersect with the detection zone
                 val filteredObjects = detectionsWithDistance.filter { obj ->
                     RectF.intersects(obj.boundingBox, detectionRect)
                 }
-                
+
                 Log.d("AR Detection", "Total detected: ${detectionsWithDistance.size}, In zone: ${filteredObjects.size}")
-                
+
                 // Log distance measurements for debugging
                 filteredObjects.forEach { obj ->
                     Log.d("AR Distance", "${obj.label}: ${String.format("%.2f", obj.distance)}m")
                 }
-                
+
                 withContext(Dispatchers.Main) {
                     onObjectsDetected(filteredObjects)
                 }
-                
+
                 cameraImage.close()
             }
         } catch (e: Exception) {
@@ -1064,17 +813,17 @@ private fun imageProxyToBitmap(image: Image): Bitmap {
     val yBuffer = planes[0].buffer
     val uBuffer = planes[1].buffer
     val vBuffer = planes[2].buffer
-    
+
     val ySize = yBuffer.remaining()
     val uSize = uBuffer.remaining()
     val vSize = vBuffer.remaining()
-    
+
     val nv21 = ByteArray(ySize + uSize + vSize)
-    
+
     yBuffer.get(nv21, 0, ySize)
     vBuffer.get(nv21, ySize, vSize)
     uBuffer.get(nv21, ySize + vSize, uSize)
-    
+
     val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
     val out = ByteArrayOutputStream()
     yuvImage.compressToJpeg(Rect(0, 0, yuvImage.width, yuvImage.height), 100, out)
@@ -1090,7 +839,7 @@ private suspend fun capturePhoto(frame: Frame, context: Context) {
                 val bitmap = imageProxyToBitmap(cameraImage)
                 saveImageToGallery(bitmap, context)
                 cameraImage.close()
-                
+
                 withContext(Dispatchers.Main) {
                     Toast.makeText(context, "Photo saved to gallery!", Toast.LENGTH_SHORT).show()
                 }
@@ -1107,23 +856,22 @@ private suspend fun capturePhoto(frame: Frame, context: Context) {
 private fun saveImageToGallery(bitmap: Bitmap, context: Context) {
     val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
     val filename = "AR_Photo_$timestamp.jpg"
-    
+
     val picturesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
     val arDir = File(picturesDir, "AR_Test")
     if (!arDir.exists()) {
         arDir.mkdirs()
     }
-    
+
     val file = File(arDir, filename)
-    
+
     try {
         val outputStream = FileOutputStream(file)
         bitmap.compress(Bitmap.CompressFormat.JPEG, 90, outputStream)
         outputStream.flush()
         outputStream.close()
-        
+
         Log.d("Save Image", "Image saved to: ${file.absolutePath}")
-        
     } catch (e: Exception) {
         Log.e("Save Image", "Error saving image", e)
     }
